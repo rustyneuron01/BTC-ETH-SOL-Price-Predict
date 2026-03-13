@@ -1,146 +1,227 @@
-# Ordinal Marketplace Backend
+<div align="center">
+  <img alt="Project logo" src="docs/images/logo.png" height="134" />
+</div>
 
-## Description
+<h1 align="center">
+    Ensemble Price Forecasting
+</h1>
 
-A robust backend system for an Ordinal NFT marketplace built with NestJS and PostgreSQL. This platform enables users to list Bitcoin Ordinal inscriptions, make offers, engage in discussions through comments, and participate in both global and direct messaging.
+<div align="center">
+    <a href="#"><b>Resources</b></a>
+</div>
 
-## Key Features
+---
 
-- **Inscription Management**
-  - List and manage Ordinal inscriptions
-  - Associate inscriptions with collections
-  - Track inscription ownership and transfers
+<div align="center">[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)][license]</div>
 
-- **Trading System**
-  - Create and manage swap offers
-  - Support for buyer and seller interactions
-  - PSBT (Partially Signed Bitcoin Transaction) handling
-  - Secure transaction processing
+---
 
-- **Collection Management**
-  - Create and manage collections
-  - Associate inscriptions with collections
-  - Collection metadata management (name, description, social links)
+## Summary
 
-- **Communication System**
-  - Global chat for community discussions
-  - Direct messaging between users
-  - Comment system for inscriptions
-  - Real-time messaging using WebSocket
-  - Message persistence in PostgreSQL
-  - Redis pub/sub for message distribution
+This project produces **ensemble forecasts** of future asset prices (many simulated paths per request) to capture full **probability distributions** of price movement, not just point estimates. Output is synthetic price data for training AI agents and for options pricing and portfolio risk analytics. Quality is measured with the **Continuous Ranked Probability Score (CRPS)** over ensemble predictions against realized prices, with focus on **calibration and sharpness** (e.g. volatility clustering, fat tails).
 
-- **User System**
-  - Wallet integration (UniSat, Hiro, Xverse)
-  - User authentication via message signing
-  - Role-based access control (customer, admin)
+---
 
-- **Performance Optimization**
-  - LavinMQ integration for message queuing
-  - Redis caching for high-performance data access
-  - Optimized for handling large request volumes
+### Table of contents
 
-## Technical Stack
+- [1. Overview](#-1-overview)
+  - [1.1. Introduction](#11-introduction)
+  - [1.2. Task Presented to Workers](#12-task-presented-to-workers)
+  - [1.3. Coordinator's Scoring Methodology](#13-coordinators-scoring-methodology)
+  - [1.4. Calculation of Leaderboard Score](#14-calculation-of-leaderboard-score)
+  - [1.5. Overall Purpose](#15-overall-purpose)
+- [2. Tech stack](#2-tech-stack)
+- [3. Usage](#-3-usage)
+- [4. License](#-4-license)
 
-- **Framework**: NestJS
-- **Database**: PostgreSQL with TypeORM
-- **Caching**: Redis
-- **Message Queue**: LavinMQ
-- **Authentication**: Bitcoin wallet signature verification
-- **Bitcoin Integration**: BitcoinJS, BIP322
+---
 
-## Project Structure
+## 🔭 1. Overview
 
-```
-src/
-├── auth/                 # Authentication and authorization
-├── collection/           # Collection management
-├── inscription/          # Ordinal inscription handling
-├── psbt/                # Bitcoin transaction handling
-├── swap-offer/          # Trading system
-├── user/                # User management
-└── common/              # Shared utilities and types
-```
+### 1.1. Introduction
 
-## Database Schema
+This system provides high-quality synthetic price data and probabilistic forecasting. **Workers** generate multiple simulated price paths per request; paths must reflect real-world dynamics (volatility clustering, fat-tailed distributions). **Coordinators** score workers using the Continuous Ranked Probability Score (CRPS), which measures both calibration and sharpness of forecasts against actual price movements. Recent performance is weighted more heavily; emissions are allocated by relative performance.
 
-Key entities include:
-- User
-- Collection
-- Inscription
-- SwapOffer
-- BuyerSwapInscription
-- SellerSwapInscription
-- SignMessage
+<div align="center">
+    <img alt="Overview diagram" src="docs/images/synth_diagram@1920x1080.png" />
+</div>
 
-## Local Development
+*Figure 1.1: System overview.*
 
-### Prerequisites
+The system aims to be a key source of synthetic price data for AI agents and for options trading and portfolio management.
 
-- Node.js >= 18.12.1
-- Docker and Docker Compose
-- PostgreSQL
-- Redis
-- LavinMQ
+<sup>[Back to top ^][table-of-contents]</sup>
 
-### Setup with Docker
+### 1.2. Task Presented to Workers
 
-1. Install Docker and Docker Compose
-2. Clone the repository
-3. Run the development environment:
+```mermaid
+sequenceDiagram
+    participant Worker
+    participant Coordinator
+    participant Storage
 
-```bash
-# Start the containers
-docker-compose up -d
+    loop Every Hour
+        Coordinator->>Worker: Request with input prompts
+        note left of Coordinator: asset='BTC', start_time='2025-02-10T14:59:00', time_increment=300, etc.
 
-# Install dependencies
-npm install
+        Worker-->>Coordinator: Prediction results
+        note right of Worker: result: price prediction <br/> [[{"time": "2025-02-10T14:59:00+00:00", "price": 97352.60591372}, ...], ...]
 
-# Start the development server
-npm run start:dev
+        Coordinator->>Coordinator: Run "prediction results" validation function
+
+        alt Validation error
+            Coordinator->>Storage: Save error
+        else No errors
+            Coordinator->>Storage: Save prediction results
+        end
+    end
 ```
 
-Access the API documentation at `http://localhost:3005/docs`
+Workers provide **probabilistic forecasts** of future price movements: multiple simulated price paths per asset over specified time increments and horizon. Current request format: **1000 simulated paths** for BTC, ETH, SOL, XAU (and tokenized equities SPYX, NVDAX, TSLAX, AAPLX, GOOGLX) over 24 hours at 5-minute increments. The system focuses on **quantifying uncertainty**—paths should represent the worker’s view of the probability distribution and encapsulate realistic dynamics (volatility clustering, fat tails).
 
-### Database Connection
+**Prompt parameters:** (start_time, asset, time_increment, time_horizon, num_simulations)
 
-Connect to the local Postgres Database:
+- **Start Time ($t_0$)**: 1 minute from the time of the request.
+- **Asset**: BTC, ETH, XAU, SOL, SPYX, NVDAX, TSLAX, AAPLX, GOOGLX (CRPS per asset contributes to final worker weights).
+- **Time Increment ($\Delta t$)**: 5 minutes.
+- **Time Horizon ($T$)**: 24 hours.
+- **Number of Simulations ($N_{\text{sim}}$)**: 1000.
 
-```bash
-psql -h db -U postgres postgres
+**Asset Weights**  
+BTC 1.0 · ETH 0.67 · XAU 2.26 · SOL 0.59 · SPYX 2.99 · NVDAX 1.39 · TSLAX 1.42 · AAPLX 1.86 · GOOGLX 1.43
+
+Coordinators send requests (e.g. BTC/ETH at 30 min intervals). The worker has until the start time to return $N_{\text{sim}}$ paths. Use the Pyth Oracle (or equivalent) for the asset price at start_time. Late or invalid responses are scored 0 for that prompt.
+
+**1-Hour HFT:** The system also runs a short-horizon task (1 hour, BTC/ETH/SOL/XAU). Emissions split: 50% 24-hour predictions, 50% 1-hour HFT.
+
+<sup>[Back to top ^][table-of-contents]</sup>
+
+### 1.3. Coordinator's Scoring Methodology
+
+After the time horizon has passed, coordinators compare each worker’s predicted paths to realized prices using the **Continuous Ranked Probability Score (CRPS)**. CRPS is a proper scoring rule for continuous variables (calibration + sharpness). Lower CRPS = better forecast.
+
+#### Application of CRPS to Ensemble Forecasts
+
+Workers produce **ensemble forecasts** (a finite number of simulated paths). For observation $x$ and ensemble $y_1, \dots, y_N$:
+
+$$
+\text{CRPS} = \frac{1}{N}\sum_{n=1}^N \left| y_n - x \right| - \frac{1}{2N^2} \sum_{n=1}^N \sum_{m=1}^N \left| y_n - y_m \right|
+$$
+
+The first term is average absolute error vs. observation; the second term accounts for ensemble spread. CRPS is computed on **price change in basis points** per interval so scores are comparable across assets.
+
+#### Application to Multiple Time Increments
+
+CRPS is applied over several intervals (e.g. 5 min, 30 min, 3 h, 24 h). For each increment: predicted price changes (from worker paths), observed price changes (from real prices, e.g. Pyth at each step), then CRPS. The **final score for a worker for one prompt** is the sum of CRPS over all increments.
+
+<sup>[Back to top ^][table-of-contents]</sup>
+
+### 1.4. Calculation of Leaderboard Score
+
+```mermaid
+sequenceDiagram
+    loop Every Hour
+        participant Coordinator
+        participant Storage
+        participant PricesProvider as Prices Provider
+        participant Network
+
+        Coordinator->>Storage: Get prediction (at least 24 hours old)
+        Coordinator->>PricesProvider: Get real prices
+        Coordinator->>Coordinator: Calculate CRPS
+        Coordinator->>Coordinator: Get Best Score
+        Coordinator->>Coordinator: Assign 90th Percentile Score to Invalid and Worst 10% scores
+        Coordinator->>Coordinator: Subtract Best Score from all scores
+        Coordinator->>Coordinator: Save scores
+        Coordinator->>Storage: Get scores for past days
+        Coordinator->>Coordinator: Calculate moving average
+        Coordinator->>Coordinator: Softmax to get final weights
+        Coordinator->>Storage: Save final weights
+        Coordinator->>Network: Send final weights
+    end
 ```
-Password: `postgres`
 
-## Available Scripts
+#### CRPS Transformation
 
-```bash
-# Development
-npm run start:dev
+- Rank workers by CRPS sum; cap worst 10% at 90th percentile.
+- Subtract the best (lowest) CRPS from all scores so the best worker gets 0.
+- Workers that failed to submit valid predictions in time get the 90th percentile score.
 
-# Production build
-npm run build
-npm run start:prod
+#### Rolling Average (Leaderboard Score)
 
-# Testing
-npm run test
-npm run test:e2e
+Coordinators store per-request scores and compute a **rolling average** over the past 10 days, weighted by asset. Leaderboard score for worker $i$ at time $t$:
+
+$$
+L_i(t) = \frac{\sum_{j} S_{i,j} w_{k,j}}{\sum_{j} w_{k,j}}
+$$
+
+($S_{i,j}$ = score of worker $i$ at request $j$; $w_{k,j}$ = asset weight. Sum over $j$ with $t - t_j \leq T$, $T = 10$ days.) Lowest score = highest rank.
+
+#### Final Emissions
+
+$$
+A_i(t) = \frac{e^{-\beta \cdot L_i(t)}}{\sum_j e^{-\beta \cdot L_j(t)}} \cdot E(t)
+$$
+
+with $\beta = -0.1$ and $E(t)$ total emission at time $t$.
+
+### 1.5. Overall Purpose
+
+1. **CRPS scoring** — Objective measure of forecast quality across time increments.  
+2. **Ensemble forecasts** — CRPS from finite simulations.  
+3. **Multiple time increments** — Short- and long-term evaluation.  
+4. **Moving average** — Rewards consistency.  
+5. **Softmax allocation** — Emissions proportional to performance.
+
+<sup>[Back to top ^][table-of-contents]</sup>
+
+---
+
+## 2. Tech stack
+
+| Category | Technologies |
+|----------|---------------|
+| **Language & runtime** | Python 3.11 |
+| **ML / volatility** | XGBoost (volatility prediction from cached features) |
+| **Numerics & scoring** | NumPy, Pandas, properscoring (CRPS) |
+| **Price data** | Pyth (Hermes) API; cached data for volatility training |
+| **Backend & API** | Pydantic, async request handling |
+| **Data & storage** | PostgreSQL, SQLAlchemy, Alembic |
+| **Observability** | Google Cloud Logging, Weights & Biases (optional) |
+| **DevOps** | Docker, Docker Compose |
+| **Testing** | pytest, CRPS/validation/simulation fixtures |
+
+---
+
+## 🪄 3. Usage
+
+### 3.1. Workers
+
+- **Tutorial:** [Worker tutorial](./docs/miner_tutorial.md) — set up and run a worker.
+- **Reference:** [Worker reference](./docs/miner_reference.md) (options, FAQs, troubleshooting).
+
+### 3.2. Coordinators
+
+- **Guide:** [Coordinator guide](./docs/validator_guide.md) — set up and run a coordinator.
+
+### 3.3. Develop
+
+```shell
+pip install -r requirements-dev.txt
+pre-commit install
 ```
 
-## API Documentation
+<sup>[Back to top ^][table-of-contents]</sup>
 
-The API documentation is available through Swagger UI at `/docs` endpoint when running the server.
+---
 
-## Performance Considerations
+## 📄 4. License
 
-- Uses Redis caching for frequently accessed data
-- LavinMQ for handling asynchronous tasks and large request volumes
-- Optimized database queries and indexing
-- Efficient PSBT handling for Bitcoin transactions
+See the [LICENSE][license] file.
 
-## Security Features
+<sup>[Back to top ^][table-of-contents]</sup>
 
-- Wallet-based authentication
-- Message signing verification
-- Role-based access control
-- Secure PSBT handling
-- Environment-based configuration
+<!-- links -->
+
+[license]: LICENSE
+[table-of-contents]: #table-of-contents
